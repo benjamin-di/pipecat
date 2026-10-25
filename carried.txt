@@ -1,0 +1,10 @@
+Upstream baseline: pipecat-ai/pipecat v1.14.0
+Baseline commit: 82c4fdb484db32e3ef933d03c59a395dd7f9a53b
+
+Pending patch: fix/livekit-dtmf-sequence
+Send every native LiveKit DTMF digit in order and propagate send failures.
+Upstream pull request: not yet submitted.
+Drop the patch when an official Pipecat release includes the fix.
+
+Retain deployed fleet tags unchanged. This branch carries no application,
+deployment credentials, private fixtures or unrelated framework changes.

@@ -8,3 +8,6 @@ Drop the patch when an official Pipecat release includes the fix.
 
 Retain deployed fleet tags unchanged. This branch carries no application,
 deployment credentials, private fixtures or unrelated framework changes.
+
+Python package releases use PEP 440 tags such as v1.14.0.post1+fleet.1.
+The earlier v1.14.0-fleet.1 tag is not a Python-buildable release and is not used.

@@ -105,6 +105,7 @@ class AudioBufferProcessor(FrameProcessor):
         buffer_size: int = 0,
         enable_turn_audio: bool = False,
         auto_start_recording: bool = False,
+        continuous_streams: bool = False,
         **kwargs,
     ):
         """Initialize the audio buffer processor.
@@ -117,9 +118,16 @@ class AudioBufferProcessor(FrameProcessor):
             auto_start_recording: Whether to start recording automatically when
                 the pipeline starts, without requiring a call to
                 :meth:`start_recording` or an ``AudioBufferStartRecordingFrame``.
+            continuous_streams: Whether both sources already include silence and
+                share a sample clock. Preserve first-frame start offsets, then
+                align by sample count instead of delivery gaps or speaking state. Preserve pending samples when
+                flushing chunks; pad only the final incomplete track at stop.
+                ``buffer_size`` must be even when this is enabled.
             **kwargs: Additional arguments passed to parent class.
         """
         super().__init__(**kwargs)
+        if continuous_streams and buffer_size % 2:
+            raise ValueError("Continuous audio buffer_size must be a multiple of two")
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
         self._audio_buffer_size_1s = 0
@@ -127,6 +135,9 @@ class AudioBufferProcessor(FrameProcessor):
         self._buffer_size = buffer_size
         self._enable_turn_audio = enable_turn_audio
         self._auto_start_recording = auto_start_recording
+        self._continuous_streams = continuous_streams
+        self._continuous_started_at = 0.0
+        self._continuous_seen: set[str] = set()
 
         self._user_audio_buffer = bytearray()
         self._bot_audio_buffer = bytearray()
@@ -241,6 +252,8 @@ class AudioBufferProcessor(FrameProcessor):
             return
         self._recording = True
         self._reset_recording()
+        self._continuous_started_at = time.monotonic()
+        self._continuous_seen.clear()
         await self._call_event_handler("on_recording_started")
 
     async def stop_recording(self):
@@ -291,6 +304,9 @@ class AudioBufferProcessor(FrameProcessor):
 
     async def _process_recording(self, frame: Frame):
         """Process audio frames for recording."""
+        if self._continuous_streams:
+            await self._process_continuous_recording(frame)
+            return
         # Track speaking state here (not just in _process_turn_recording) so the
         # silence-injection guards below work regardless of enable_turn_audio.
         if isinstance(frame, UserStartedSpeakingFrame):
@@ -374,6 +390,47 @@ class AudioBufferProcessor(FrameProcessor):
             self._reset_primary_audio_buffers()
 
         # Process turn recording with preprocessed data.
+        if self._enable_turn_audio:
+            await self._process_turn_recording(frame, resampled)
+
+    async def _process_continuous_recording(self, frame: Frame):
+        """Buffer continuous tracks without interpreting delivery jitter as silence."""
+        resampled = None
+        track = None
+        if isinstance(frame, InputAudioRawFrame):
+            resampled = await self._resample_input_audio(frame)
+            buffer, track = self._user_audio_buffer, "user"
+        elif isinstance(frame, OutputAudioRawFrame):
+            resampled = await self._resample_output_audio(frame)
+            buffer, track = self._bot_audio_buffer, "bot"
+
+        if track and resampled:
+            if track not in self._continuous_seen:
+                # Establish each stream's origin once. Later delivery pauses
+                # do not move its sample clock or manufacture extra silence.
+                duration = len(resampled) / (self._sample_rate * 2)
+                gap = time.monotonic() - self._continuous_started_at - duration
+                if gap > 0.02:
+                    buffer.extend(bytes(round(gap * self._sample_rate) * 2))
+                self._continuous_seen.add(track)
+            buffer.extend(resampled)
+
+        if self._buffer_size > 0:
+            while (
+                min(len(self._user_audio_buffer), len(self._bot_audio_buffer)) >= self._buffer_size
+            ):
+                await self._call_on_audio_data_handler(size=self._buffer_size)
+                del self._user_audio_buffer[: self._buffer_size]
+                del self._bot_audio_buffer[: self._buffer_size]
+
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._user_speaking = True
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self._user_speaking = False
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
         if self._enable_turn_audio:
             await self._process_turn_recording(frame, resampled)
 
@@ -519,7 +576,7 @@ class AudioBufferProcessor(FrameProcessor):
                 ),
             )
 
-    async def _call_on_audio_data_handler(self):
+    async def _call_on_audio_data_handler(self, size: int | None = None):
         """Call the audio data event handlers with buffered audio."""
         if not self._recording:
             return
@@ -528,10 +585,19 @@ class AudioBufferProcessor(FrameProcessor):
             return
 
         # Final alignment before we send the audio
-        self._align_track_buffers()
+        if size is None:
+            self._align_track_buffers()
+
+        user = bytes(self._user_audio_buffer[:size])
+        bot = bytes(self._bot_audio_buffer[:size])
 
         # Call original handler with merged audio
-        merged_audio = self.merge_audio_buffers()
+        if self._num_channels == 1:
+            merged_audio = mix_audio(user, bot)
+        elif self._num_channels == 2:
+            merged_audio = interleave_stereo_audio(user, bot)
+        else:
+            merged_audio = b""
         await self._call_event_handler(
             "on_audio_data", merged_audio, self._sample_rate, self._num_channels
         )
@@ -539,8 +605,8 @@ class AudioBufferProcessor(FrameProcessor):
         # Call new handler with separate tracks
         await self._call_event_handler(
             "on_track_audio_data",
-            bytes(self._user_audio_buffer),
-            bytes(self._bot_audio_buffer),
+            user,
+            bot,
             self._sample_rate,
             self._num_channels,
         )

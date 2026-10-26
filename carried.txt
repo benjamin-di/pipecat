@@ -11,3 +11,10 @@ deployment credentials, private fixtures or unrelated framework changes.
 
 Python package releases use PEP 440 tags such as v1.14.0.post1+fleet.1.
 The earlier v1.14.0-fleet.1 tag is not a Python-buildable release and is not used.
+
+Pending patch: continuous recording sample clock
+Continuous, silence-inclusive tracks use sample counts and retain unmatched
+samples across chunk flushes. Event-driven streams retain their existing
+arrival-time/speaking-state alignment. Regression coverage includes delayed
+bursts, unequal frame sizes, final padding and five-minute sample preservation.
+Drop the patch when an official Pipecat release includes the fix.

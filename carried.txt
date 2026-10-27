@@ -6,6 +6,12 @@ Send every native LiveKit DTMF digit in order and propagate send failures.
 Upstream pull request: https://github.com/pipecat-ai/pipecat/pull/6371
 Drop the patch when an official Pipecat release includes the fix.
 
+Pending patch: Grok interruption isolation
+Retain interrupting input in both turn modes. Ignore late audio, audio-completion
+and spoken-transcript events from interrupted responses so they cannot restart
+playback after the transport queue is cleared. Response retention is bounded.
+Drop the patch when an official Pipecat release includes the fix.
+
 Retain deployed fleet tags unchanged. This branch carries no application,
 deployment credentials, private fixtures or unrelated framework changes.
 

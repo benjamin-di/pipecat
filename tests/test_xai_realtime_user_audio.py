@@ -129,6 +129,52 @@ async def test_manual_turn_interruption_preserves_the_interrupting_user_audio():
 
 
 @pytest.mark.asyncio
+async def test_tool_reply_waits_for_manual_user_turn_commit():
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    await service._handle_user_started_speaking(None)
+    service._results_awaiting_response = True
+    await service._create_response()
+    assert recorder.kinds() == []
+    assert service._response_create_owed
+    await service._handle_user_stopped_speaking(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+async def test_manual_response_waits_for_previous_response_to_finish():
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    service._response_active = True
+    await service._handle_user_stopped_speaking(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    await service._handle_evt_response_done(
+        events.ResponseDone(
+            type="response.done",
+            event_id="event-done",
+            response=events.Response(
+                id="response-a", object="realtime.response", status="completed", output=[]
+            ),
+        )
+    )
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
 async def test_late_cancelled_audio_and_transcript_cannot_restart_playback():
     from unittest.mock import AsyncMock
 

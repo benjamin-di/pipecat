@@ -324,6 +324,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         # once that one is done.
         self._response_create_owed = False
         self._response_active = False
+        self._user_speaking = False
 
         self._session_id: str | None = None
         self._conversation_id: str | None = None
@@ -446,13 +447,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_user_started_speaking(self, frame):
         """Handle user started speaking event."""
-        pass
+        self._user_speaking = True
 
     async def _handle_user_stopped_speaking(self, frame):
         """Handle user stopped speaking event."""
+        self._user_speaking = False
         if not self._is_turn_detection_enabled():
             await self.send_client_event(events.InputAudioBufferCommitEvent())
-            await self.send_client_event(events.ResponseCreateEvent())
+            self._results_awaiting_response = True
+            await self._create_response()
 
     async def _handle_bot_stopped_speaking(self):
         """Handle bot stopped speaking event."""
@@ -790,6 +793,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._open_function_calls = set()
             self._interrupted_response_ids.clear()
             self._response_active = False
+            self._user_speaking = False
             self._response_create_owed = False
             self._disconnecting = False
         except Exception as e:
@@ -1232,10 +1236,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._run_llm_when_api_session_ready = True
             return
 
-        if self._response_active:
+        if self._response_active or self._user_speaking:
             # The API refuses a second response while one is running. Hold this
             # one for response.done rather than losing it to that error.
-            logger.debug("Response already active — holding the next one until it is done")
+            logger.debug("Holding the next response until the current turn is complete")
             self._response_create_owed = True
             return
 

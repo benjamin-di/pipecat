@@ -738,7 +738,11 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         Args:
             event: The client event to send.
         """
-        await self._ws_send(event.model_dump(exclude_none=True))
+        message = event.model_dump(exclude_none=True)
+        if isinstance(event, events.SessionUpdateEvent) and event.session.turn_detection is None:
+            # Omitting this field leaves native VAD enabled on the server.
+            message["session"]["turn_detection"] = None
+        await self._ws_send(message)
 
     async def _connect(self):
         """Establish WebSocket connection to Grok."""

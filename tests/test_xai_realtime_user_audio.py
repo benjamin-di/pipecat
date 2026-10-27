@@ -56,6 +56,21 @@ def test_default_model_is_grok_voice_latest():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("server_vad", [False, True])
+async def test_session_update_serializes_explicit_manual_mode(server_vad):
+    from unittest.mock import AsyncMock
+
+    props = SessionProperties(
+        turn_detection=TurnDetection(type="server_vad") if server_vad else None
+    )
+    service = GrokRealtimeLLMService(api_key="test-key")
+    service._ws_send = AsyncMock()
+    await service.send_client_event(events.SessionUpdateEvent(session=props))
+    actual = service._ws_send.await_args.args[0]["session"]["turn_detection"]
+    assert actual == ({"type": "server_vad"} if server_vad else None)
+
+
+@pytest.mark.asyncio
 async def test_user_audio_dropped_until_session_ready():
     from unittest.mock import patch
 

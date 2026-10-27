@@ -10,6 +10,7 @@ Pending patch: Grok interruption isolation
 Retain interrupting input in both turn modes. Ignore late audio, audio-completion
 and spoken-transcript events from interrupted responses so they cannot restart
 playback after the transport queue is cleared. Response retention is bounded.
+Serialize explicit null turn detection so manual mode actually disables native VAD.
 Drop the patch when an official Pipecat release includes the fix.
 
 Retain deployed fleet tags unchanged. This branch carries no application,

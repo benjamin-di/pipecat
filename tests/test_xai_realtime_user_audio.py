@@ -6,6 +6,7 @@
 
 """Tests for user-audio and interruption handling in GrokRealtimeLLMService."""
 
+import asyncio
 import base64
 from typing import Any
 
@@ -146,6 +147,54 @@ async def test_tool_reply_waits_for_manual_user_turn_commit():
     assert service._response_create_owed
     await service._handle_user_stopped_speaking(None)
     assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resumes_speaking", [False, True])
+async def test_tool_reply_cannot_overtake_an_in_progress_audio_commit(resumes_speaking):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    committing, release = asyncio.Event(), asyncio.Event()
+
+    async def send(event):
+        if isinstance(event, events.InputAudioBufferCommitEvent):
+            committing.set()
+            await release.wait()
+        await recorder(event)
+
+    service.send_client_event = send
+    await service._handle_user_started_speaking(None)
+    stopped = asyncio.create_task(service._handle_user_stopped_speaking(None))
+    try:
+        await asyncio.wait_for(committing.wait(), 1)
+        service._results_awaiting_response = True
+        await service._create_response()
+        before_commit = recorder.kinds()
+        if resumes_speaking:
+            await service._handle_user_started_speaking(None)
+    finally:
+        release.set()
+        await stopped
+
+    assert before_commit == []
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"] + (
+        [] if resumes_speaking else ["ResponseCreateEvent"]
+    )
+    if resumes_speaking:
+        assert service._user_speaking
+        await service._handle_user_stopped_speaking(None)
+        assert recorder.kinds() == [
+            "InputAudioBufferCommitEvent",
+            "InputAudioBufferCommitEvent",
+            "ResponseCreateEvent",
+        ]
 
 
 @pytest.mark.asyncio

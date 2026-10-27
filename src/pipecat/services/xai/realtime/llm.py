@@ -325,6 +325,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._response_create_owed = False
         self._response_active = False
         self._user_speaking = False
+        self._audio_commit_in_progress = False
 
         self._session_id: str | None = None
         self._conversation_id: str | None = None
@@ -453,7 +454,13 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """Handle user stopped speaking event."""
         self._user_speaking = False
         if not self._is_turn_detection_enabled():
-            await self.send_client_event(events.InputAudioBufferCommitEvent())
+            # A tool can finish while this send yields. Keep its response
+            # behind the commit without masking speech that starts meanwhile.
+            self._audio_commit_in_progress = True
+            try:
+                await self.send_client_event(events.InputAudioBufferCommitEvent())
+            finally:
+                self._audio_commit_in_progress = False
             self._results_awaiting_response = True
             await self._create_response()
 
@@ -794,6 +801,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._interrupted_response_ids.clear()
             self._response_active = False
             self._user_speaking = False
+            self._audio_commit_in_progress = False
             self._response_create_owed = False
             self._disconnecting = False
         except Exception as e:
@@ -1236,7 +1244,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._run_llm_when_api_session_ready = True
             return
 
-        if self._response_active or self._user_speaking:
+        if self._response_active or self._user_speaking or self._audio_commit_in_progress:
             # The API refuses a second response while one is running. Hold this
             # one for response.done rather than losing it to that error.
             logger.debug("Holding the next response until the current turn is complete")

@@ -12,7 +12,9 @@ and spoken-transcript events from interrupted responses so they cannot restart
 playback after the transport queue is cleared. Response retention is bounded.
 Serialize explicit null turn detection so manual mode actually disables native VAD.
 Hold asynchronous tool replies while the user speaks and commit each manual
-turn before requesting its response. Serialize overlapping response requests.
+turn before requesting its response, including replies arriving during the
+commit write. Preserve speech that resumes during that write. Serialize
+overlapping response requests.
 Drop the patch when an official Pipecat release includes the fix.
 
 Retain deployed fleet tags unchanged. This branch carries no application,

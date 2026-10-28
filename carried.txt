@@ -1,36 +1,25 @@
 Upstream baseline: pipecat-ai/pipecat v1.14.0
 Baseline commit: 82c4fdb484db32e3ef933d03c59a395dd7f9a53b
 
-Pending patch: fix/livekit-dtmf-sequence
-Send every native LiveKit DTMF digit in order and propagate send failures.
+fix/livekit-dtmf-sequence: send complete native DTMF sequences and propagate errors.
 Upstream pull request: https://github.com/pipecat-ai/pipecat/pull/6371
-Drop the patch when an official Pipecat release includes the fix.
+Drop when an official release includes the fix.
 
-Pending patch: Grok interruption isolation
-Retain interrupting input in both turn modes. Ignore late audio, audio-completion
-and spoken-transcript events from interrupted responses so they cannot restart
-playback after the transport queue is cleared. Response retention is bounded.
-Serialize explicit null turn detection so the API never ends or commits a manual
-turn itself (it still reports speech starts). Hold asynchronous tool replies
-while the user speaks and request each manual turn's response only after the API
-acknowledges its commit (input_audio_buffer.committed), bounded by a fallback:
-the API can otherwise start a response with newly added tool output before it
-processes the commit, omitting the user's turn. A speech segment open while a
-response is cancelled can leave every later commit unacknowledged; only clearing
-the buffer recovers. Retain the turn's input once and, for an unacknowledged
-commit, clear, replay and recommit it, restoring input received since. Preserve
-speech that resumes meanwhile. Serialize overlapping response requests.
-Drop the patch when an official Pipecat release includes the fix.
+fix/audio-continuous-clock: preserve sample clocks and unmatched samples across
+continuous-stream recording flushes. Upstream proposal: unsubmitted.
+Drop when an official release includes the behavior and its sample-clock tests pass.
 
-Retain deployed fleet tags unchanged. This branch carries no application,
-deployment credentials, private fixtures or unrelated framework changes.
+fix/xai-interruption-isolation: retain interrupting input and suppress late output
+from cancelled responses. Upstream proposal: unsubmitted.
+Drop when an official release passes the interruption-isolation regressions.
 
-Python package releases use PEP 440 tags such as v1.14.0.post1+fleet.1.
-The earlier v1.14.0-fleet.1 tag is not a Python-buildable release and is not used.
+fix/xai-manual-turn-coordination (based on fix/xai-interruption-isolation): serialize
+explicit null turn detection, defer tool replies until turn commit, retain and
+replay one ignored commit, finish recovery despite late acknowledgements, and
+restore new speech without mixing turns. Upstream proposal: unsubmitted.
+Drop when an official release passes manual-turn, resumed-speech and recovery tests.
 
-Pending patch: continuous recording sample clock
-Continuous, silence-inclusive tracks use sample counts and retain unmatched
-samples across chunk flushes. Event-driven streams retain their existing
-arrival-time/speaking-state alignment. Regression coverage includes delayed
-bursts, unequal frame sizes, final padding and five-minute sample preservation.
-Drop the patch when an official Pipecat release includes the fix.
+build/carried-media-checks: generic CI for the carried media regressions.
+Drop when the runtime topics are removed. Immutable release tags are retained.
+The consuming wrapper records exact topic heads, fixed merge order and removal
+conditions. No application prompts, credentials, deployment or call data are carried.

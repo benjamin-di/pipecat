@@ -1,0 +1,25 @@
+Upstream baseline: pipecat-ai/pipecat v1.14.0
+Baseline commit: 82c4fdb484db32e3ef933d03c59a395dd7f9a53b
+
+carry/livekit-dtmf-sequence: send complete native DTMF sequences and propagate errors.
+Upstream pull request: https://github.com/pipecat-ai/pipecat/pull/6371
+Drop when an official release includes the fix.
+
+fix/audio-continuous-clock: preserve sample clocks and unmatched samples across
+continuous-stream recording flushes. Upstream proposal: unsubmitted.
+Drop when an official release includes the behavior and its sample-clock tests pass.
+
+fix/xai-interruption-isolation: retain interrupting input and suppress late output
+from cancelled responses. Upstream proposal: unsubmitted.
+Drop when an official release passes the interruption-isolation regressions.
+
+fix/xai-manual-turn-coordination (based on fix/xai-interruption-isolation): serialize
+explicit null turn detection, defer tool replies until turn commit, retain and
+replay one ignored commit, finish recovery despite late acknowledgements, and
+restore new speech without mixing turns. Upstream proposal: unsubmitted.
+Drop when an official release passes manual-turn, resumed-speech and recovery tests.
+
+build/carried-media-checks: generic CI for the carried media regressions.
+Drop when the runtime topics are removed. Immutable release tags are retained.
+The consuming wrapper records exact topic heads, fixed merge order and removal
+conditions. No application prompts, credentials, deployment or call data are carried.

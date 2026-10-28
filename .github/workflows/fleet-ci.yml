@@ -1,0 +1,41 @@
+name: Fleet CI
+on:
+  push:
+    branches: [fleet]
+  pull_request:
+    branches: [fleet]
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verified: ${{ steps.gate.outputs.verified }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - run: bash .github/ci/gate.sh
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          WORKFLOW: fleet-ci.yml
+  media:
+    needs: gate
+    if: needs.gate.outputs.verified != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+      - run: uv sync --python 3.12 --group dev --extra openai --extra livekit --extra mcp
+      - run: uv run ruff check src/pipecat/processors/audio/audio_buffer_processor.py tests/test_audio_buffer_processor.py src/pipecat/services/xai/realtime/llm.py tests/test_xai_realtime_user_audio.py src/pipecat/transports/livekit/transport.py tests/test_livekit_output_clock.py
+      - run: uv run ruff format --check src/pipecat/processors/audio/audio_buffer_processor.py tests/test_audio_buffer_processor.py src/pipecat/services/xai/realtime/llm.py tests/test_xai_realtime_user_audio.py src/pipecat/transports/livekit/transport.py tests/test_livekit_output_clock.py
+      - run: uv run pytest -o addopts='' tests/test_audio_buffer_processor.py tests/test_livekit_output_clock.py tests/test_livekit_transport.py tests/test_livekit_dtmf.py tests/test_base_output_transport.py tests/test_dtmf_utils.py tests/test_xai_realtime_user_audio.py tests/test_xai_realtime_events.py

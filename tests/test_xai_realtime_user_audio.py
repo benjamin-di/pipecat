@@ -101,15 +101,63 @@ async def test_server_vad_interruption_cancels_without_clearing_input():
 
 
 @pytest.mark.asyncio
-async def test_manual_turn_interruption_clears_and_cancels():
+async def test_manual_turn_interruption_preserves_the_interrupting_user_audio():
     service, recorder = _make_service(server_vad=False)
-
+    service._api_session_ready = True
+    await service._send_user_audio(_audio_frame())
     await service._handle_interruption()
 
     assert recorder.kinds() == [
-        "InputAudioBufferClearEvent",
+        "InputAudioBufferAppendEvent",
         "ResponseCancelEvent",
     ]
+
+
+@pytest.mark.asyncio
+async def test_late_cancelled_audio_and_transcript_cannot_restart_playback():
+    from unittest.mock import AsyncMock
+
+    from pipecat.frames.frames import TTSAudioRawFrame
+
+    service, recorder = _make_service(server_vad=True)
+    service.push_frame = AsyncMock()
+    service._settings.session_properties.audio = events.AudioConfiguration(
+        output=events.AudioOutput(format=events.PCMAudioFormat(rate=24000))
+    )
+    payload = dict(event_id="event-a", item_id="audio-a", output_index=0, content_index=0)
+
+    def audio(response):
+        return events.ResponseAudioDelta(
+            type="response.output_audio.delta",
+            response_id=response,
+            delta=base64.b64encode(bytes(960)).decode(),
+            **payload,
+        )
+
+    await service._handle_evt_audio_delta(audio("response-a"))
+    await service._handle_interruption()
+    before = service.push_frame.await_count
+    await service._handle_evt_audio_delta(audio("response-a"))
+    await service._handle_evt_audio_transcript_delta(
+        events.ResponseAudioTranscriptDelta(
+            type="response.output_audio_transcript.delta",
+            response_id="response-a",
+            delta="Stale response.",
+            **payload,
+        )
+    )
+    assert service.push_frame.await_count == before
+    await service._handle_evt_audio_delta(audio("response-b"))
+    assert (
+        len(
+            [
+                c
+                for c in service.push_frame.await_args_list
+                if isinstance(c.args[0], TTSAudioRawFrame)
+            ]
+        )
+        == 2
+    )
 
 
 @pytest.mark.asyncio

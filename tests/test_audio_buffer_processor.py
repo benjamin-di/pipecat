@@ -39,7 +39,11 @@ class _PassthroughResampler:
 
 
 async def _make_processor(
-    *, buffer_size: int = 0, start: bool = True, auto_start: bool = False
+    *,
+    buffer_size: int = 0,
+    start: bool = True,
+    auto_start: bool = False,
+    continuous_streams: bool = False,
 ) -> AudioBufferProcessor:
     """Create a processor ready to record.
 
@@ -55,6 +59,7 @@ async def _make_processor(
         num_channels=2,
         buffer_size=buffer_size,
         auto_start_recording=auto_start,
+        continuous_streams=continuous_streams,
     )
     processor._input_resampler = _PassthroughResampler()
     processor._output_resampler = _PassthroughResampler()
@@ -1231,3 +1236,121 @@ class TestTurnAudio(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContinuousAudioBuffer(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_bursts_preserve_duration_samples_and_channel_alignment(self):
+        for seconds, speaking in ((20, False), (20, True), (300, True)):
+            with self.subTest(seconds=seconds, speaking=speaking):
+                processor = await _make_processor(
+                    buffer_size=160000, start=False, continuous_streams=True
+                )
+                tracks = [bytearray(), bytearray()]
+                expected = [bytearray(), bytearray()]
+
+                @processor.event_handler("on_track_audio_data")
+                async def captured(_, user, bot, rate, channels, tracks=tracks):
+                    self.assertEqual((rate, channels), (16000, 2))
+                    tracks[0].extend(user)
+                    tracks[1].extend(bot)
+
+                with patch("pipecat.processors.audio.audio_buffer_processor.time") as clock:
+                    clock.monotonic.return_value = 0
+                    await processor.start_recording()
+                    if speaking:
+                        await processor.process_frame(
+                            UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM
+                        )
+                        await processor.process_frame(
+                            BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM
+                        )
+                    pending = []
+                    for index in range(seconds * 50):
+                        clock.monotonic.return_value = index * 0.02
+                        user = struct.pack("<h", index + 1) * 320
+                        bot = struct.pack("<h", -(index + 1)) * 320
+                        expected[0].extend(user)
+                        expected[1].extend(bot)
+                        await processor.process_frame(
+                            InputAudioRawFrame(user, 16000, 1), FrameDirection.DOWNSTREAM
+                        )
+                        pending.append(bot)
+                        # Deliver the same sample clock in bursts after 300 ms pauses.
+                        if index % 50 < 35:
+                            for audio in pending:
+                                await processor.process_frame(
+                                    OutputAudioRawFrame(audio, 16000, 1), FrameDirection.DOWNSTREAM
+                                )
+                            pending.clear()
+                    for audio in pending:
+                        await processor.process_frame(
+                            OutputAudioRawFrame(audio, 16000, 1), FrameDirection.DOWNSTREAM
+                        )
+                    await processor.stop_recording()
+                await processor.cleanup()
+                self.assertEqual(tracks, expected)
+                self.assertEqual(len(tracks[0]) / 32000, seconds)
+
+    async def test_flushing_keeps_the_faster_tracks_pending_samples(self):
+        processor = await _make_processor(buffer_size=4, continuous_streams=True)
+        tracks = [bytearray(), bytearray()]
+
+        @processor.event_handler("on_track_audio_data")
+        async def captured(_, user, bot, rate, channels):
+            tracks[0].extend(user)
+            tracks[1].extend(bot)
+
+        await processor.process_frame(
+            InputAudioRawFrame(b"\x01\x00" * 10, 16000, 1), FrameDirection.DOWNSTREAM
+        )
+        await processor.process_frame(
+            OutputAudioRawFrame(b"\x02\x00" * 3, 16000, 1), FrameDirection.DOWNSTREAM
+        )
+        await processor.process_frame(
+            OutputAudioRawFrame(b"\x02\x00" * 7, 16000, 1), FrameDirection.DOWNSTREAM
+        )
+        await processor.stop_recording()
+        await processor.cleanup()
+        self.assertEqual(tracks, [b"\x01\x00" * 10, b"\x02\x00" * 10])
+
+    async def test_only_final_missing_samples_are_padded(self):
+        processor = await _make_processor(buffer_size=4, continuous_streams=True)
+        tracks = [bytearray(), bytearray()]
+
+        @processor.event_handler("on_track_audio_data")
+        async def captured(_, user, bot, rate, channels):
+            tracks[0].extend(user)
+            tracks[1].extend(bot)
+
+        await processor.process_frame(
+            InputAudioRawFrame(b"\x01\x00" * 5, 16000, 1), FrameDirection.DOWNSTREAM
+        )
+        await processor.process_frame(
+            OutputAudioRawFrame(b"\x02\x00" * 3, 16000, 1), FrameDirection.DOWNSTREAM
+        )
+        await processor.stop_recording()
+        await processor.cleanup()
+        self.assertEqual(tracks, [b"\x01\x00" * 5, b"\x02\x00" * 3 + b"\x00\x00" * 2])
+
+    def test_continuous_chunks_must_hold_whole_pcm_samples(self):
+        with self.assertRaises(ValueError):
+            AudioBufferProcessor(buffer_size=3, continuous_streams=True)
+
+
+class TestContinuousRecordingStart(unittest.IsolatedAsyncioTestCase):
+    async def test_late_first_output_preserves_the_initial_silence_only_once(self):
+        with patch("pipecat.processors.audio.audio_buffer_processor.time") as clock:
+            clock.monotonic.return_value = 0
+            processor = await _make_processor(buffer_size=32000, continuous_streams=True)
+            for index in range(25):
+                clock.monotonic.return_value = (index + 1) * 0.02
+                await processor.process_frame(
+                    InputAudioRawFrame(b"\x01\x00" * 320, 16000, 1), FrameDirection.DOWNSTREAM
+                )
+            await processor.process_frame(
+                OutputAudioRawFrame(b"\x02\x00" * 320, 16000, 1), FrameDirection.DOWNSTREAM
+            )
+            user, bot = await _capture_track_audio(processor)
+            await processor.cleanup()
+            self.assertEqual(user, b"\x01\x00" * 8000)
+            self.assertEqual(bot, bytes(7680 * 2) + b"\x02\x00" * 320)

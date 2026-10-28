@@ -15,8 +15,11 @@ turn itself (it still reports speech starts). Hold asynchronous tool replies
 while the user speaks and request each manual turn's response only after the API
 acknowledges its commit (input_audio_buffer.committed), bounded by a fallback:
 the API can otherwise start a response with newly added tool output before it
-processes the commit, omitting the user's turn. Preserve speech that resumes
-meanwhile. Serialize overlapping response requests.
+processes the commit, omitting the user's turn. A speech segment open while a
+response is cancelled can leave every later commit unacknowledged; only clearing
+the buffer recovers. Retain the turn's input once and, for an unacknowledged
+commit, clear, replay and recommit it, restoring input received since. Preserve
+speech that resumes meanwhile. Serialize overlapping response requests.
 Drop the patch when an official Pipecat release includes the fix.
 
 Retain deployed fleet tags unchanged. This branch carries no application,

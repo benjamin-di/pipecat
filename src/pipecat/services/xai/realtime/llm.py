@@ -75,6 +75,11 @@ from . import events
 
 # Bound for the API to acknowledge a manual input-audio commit.
 AUDIO_COMMIT_ACK_TIMEOUT_SECONDS = 2.0
+# Bound for the API to acknowledge clearing the input buffer before a replay.
+AUDIO_CLEAR_ACK_TIMEOUT_SECONDS = 1.0
+# Retained manual-turn input for one commit replay (about a minute of 16 kHz PCM).
+MAX_REPLAY_AUDIO_BYTES = 2_000_000
+REPLAY_APPEND_BYTES = 32_000
 
 
 @dataclass
@@ -334,6 +339,13 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         # owed: the API can otherwise start it without the committed turn.
         self._audio_commit_in_progress = False
         self._audio_commit_fallback: asyncio.Task | None = None
+        # Input appended since the last manual commit, and the committed turn's
+        # input until the API acknowledges it. Used once to replay a commit the
+        # API ignored: a speech segment open while a response is cancelled can
+        # leave later commits unacknowledged until the buffer is cleared.
+        self._turn_audio = bytearray()
+        self._pending_commit_audio: bytes | None = None
+        self._input_cleared = asyncio.Event()
 
         self._session_id: str | None = None
         self._conversation_id: str | None = None
@@ -467,8 +479,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             # masking speech that starts meanwhile.
             self._audio_commit_in_progress = True
             self._results_awaiting_response = True
+            self._pending_commit_audio = bytes(self._turn_audio)
+            self._turn_audio.clear()
             self._cancel_audio_commit_fallback()
-            self._audio_commit_fallback = asyncio.create_task(self._release_unacknowledged_commit())
+            self._audio_commit_fallback = asyncio.create_task(self._recover_unacknowledged_commit())
             await self.send_client_event(events.InputAudioBufferCommitEvent())
             await self._create_response()
 
@@ -487,16 +501,41 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._cancel_audio_commit_fallback()
         await self._finish_audio_commit()
 
-    async def _release_unacknowledged_commit(self):
-        # An empty or refused commit is never acknowledged. Don't hold the
-        # turn's response forever; the API's own error still reaches the log.
+    async def _recover_unacknowledged_commit(self):
+        """Replay an unacknowledged manual commit once, then release the response.
+
+        Clearing the input buffer is the only action that closes a stuck speech
+        segment. Replay the committed turn, commit it again and restore input
+        received since. An empty or refused commit is never acknowledged either;
+        after the replay, don't hold the turn's response forever.
+        """
         await asyncio.sleep(AUDIO_COMMIT_ACK_TIMEOUT_SECONDS)
+        replay = self._pending_commit_audio
+        if replay:
+            logger.warning(f"{self} manual audio commit was not acknowledged; replaying the turn")
+            self._input_cleared.clear()
+            await self.send_client_event(events.InputAudioBufferClearEvent())
+            try:
+                await asyncio.wait_for(self._input_cleared.wait(), AUDIO_CLEAR_ACK_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning(f"{self} input buffer clear was not acknowledged")
+            await self._append_audio_bytes(replay)
+            await self.send_client_event(events.InputAudioBufferCommitEvent())
+            if self._turn_audio:
+                await self._append_audio_bytes(bytes(self._turn_audio))
+            await asyncio.sleep(AUDIO_COMMIT_ACK_TIMEOUT_SECONDS)
         self._audio_commit_fallback = None
         logger.warning(f"{self} manual audio commit was not acknowledged; releasing the response")
         await self._finish_audio_commit()
 
+    async def _append_audio_bytes(self, audio: bytes):
+        for offset in range(0, len(audio), REPLAY_APPEND_BYTES):
+            payload = base64.b64encode(audio[offset : offset + REPLAY_APPEND_BYTES]).decode("utf-8")
+            await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
+
     async def _finish_audio_commit(self):
         self._audio_commit_in_progress = False
+        self._pending_commit_audio = None
         if self._response_create_owed and not self._response_active and not self._user_speaking:
             self._response_create_owed = False
             await self._create_response()
@@ -840,6 +879,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._user_speaking = False
             self._cancel_audio_commit_fallback()
             self._audio_commit_in_progress = False
+            self._pending_commit_audio = None
+            self._turn_audio.clear()
             self._response_create_owed = False
             self._disconnecting = False
         except Exception as e:
@@ -959,7 +1000,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             elif evt.type == "input_audio_buffer.committed":
                 await self._handle_evt_audio_committed(evt)
             elif evt.type == "input_audio_buffer.cleared":
-                pass
+                self._input_cleared.set()
             elif evt.type == "input_audio_buffer.timeout_triggered":
                 await self._handle_evt_timeout_triggered(evt)
             elif evt.type == "input_audio_buffer.dtmf_event_received":
@@ -1396,6 +1437,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 )
             return
 
+        if not self._is_turn_detection_enabled():
+            self._turn_audio.extend(frame.audio)
+            if len(self._turn_audio) > MAX_REPLAY_AUDIO_BYTES:
+                del self._turn_audio[: len(self._turn_audio) - MAX_REPLAY_AUDIO_BYTES]
         payload = base64.b64encode(frame.audio).decode("utf-8")
         await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
 

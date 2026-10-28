@@ -261,6 +261,58 @@ async def test_unacknowledged_manual_commit_releases_the_response_after_its_boun
 
 
 @pytest.mark.asyncio
+async def test_ignored_manual_commit_is_replayed_after_clearing_the_buffer(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(llm, "REPLAY_APPEND_BYTES", 4)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+
+    async def send(event):
+        await recorder(event)
+        # The API acknowledges clearing, then the replayed commit.
+        if isinstance(event, events.InputAudioBufferClearEvent):
+            service._input_cleared.set()
+
+    service.send_client_event = send
+    turn = b"\x01\x02\x03\x04\x05\x06"
+    await service._send_user_audio(_audio_frame(turn))
+    await service._handle_user_stopped_speaking(None)
+    # Speech after the commit belongs to the next turn and must survive the clear.
+    await service._send_user_audio(_audio_frame(b"\x07\x08"))
+    await asyncio.sleep(0.08)
+    kinds = recorder.kinds()
+    assert kinds == [
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferCommitEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferClearEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferCommitEvent",
+        "InputAudioBufferAppendEvent",
+    ]
+    replayed = b"".join(base64.b64decode(e.audio) for e in recorder.events[4:6])
+    assert replayed == turn
+    assert base64.b64decode(recorder.events[7].audio) == b"\x07\x08"
+    # No reply is requested until the replayed commit is acknowledged.
+    assert "ResponseCreateEvent" not in kinds
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds()[-1] == "ResponseCreateEvent"
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+    await asyncio.sleep(0.1)
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+    assert service._turn_audio == bytearray(b"\x07\x08")
+
+
+@pytest.mark.asyncio
 async def test_unsolicited_commit_acknowledgement_starts_no_response():
     from unittest.mock import AsyncMock
 

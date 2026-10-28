@@ -10,11 +10,13 @@ Pending patch: Grok interruption isolation
 Retain interrupting input in both turn modes. Ignore late audio, audio-completion
 and spoken-transcript events from interrupted responses so they cannot restart
 playback after the transport queue is cleared. Response retention is bounded.
-Serialize explicit null turn detection so manual mode actually disables native VAD.
-Hold asynchronous tool replies while the user speaks and commit each manual
-turn before requesting its response, including replies arriving during the
-commit write. Preserve speech that resumes during that write. Serialize
-overlapping response requests.
+Serialize explicit null turn detection so the API never ends or commits a manual
+turn itself (it still reports speech starts). Hold asynchronous tool replies
+while the user speaks and request each manual turn's response only after the API
+acknowledges its commit (input_audio_buffer.committed), bounded by a fallback:
+the API can otherwise start a response with newly added tool output before it
+processes the commit, omitting the user's turn. Preserve speech that resumes
+meanwhile. Serialize overlapping response requests.
 Drop the patch when an official Pipecat release includes the fix.
 
 Retain deployed fleet tags unchanged. This branch carries no application,

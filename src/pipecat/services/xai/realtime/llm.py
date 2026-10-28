@@ -10,6 +10,7 @@ Based on xAI's Grok Voice Agent API documentation:
 https://docs.x.ai/docs/guides/voice/agent
 """
 
+import asyncio
 import base64
 import json
 import time
@@ -71,6 +72,9 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 from . import events
+
+# Bound for the API to acknowledge a manual input-audio commit.
+AUDIO_COMMIT_ACK_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -325,7 +329,11 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._response_create_owed = False
         self._response_active = False
         self._user_speaking = False
+        # A manual commit is pending until the API acknowledges it with
+        # ``input_audio_buffer.committed``. A response requested meanwhile is
+        # owed: the API can otherwise start it without the committed turn.
         self._audio_commit_in_progress = False
+        self._audio_commit_fallback: asyncio.Task | None = None
 
         self._session_id: str | None = None
         self._conversation_id: str | None = None
@@ -454,14 +462,43 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """Handle user stopped speaking event."""
         self._user_speaking = False
         if not self._is_turn_detection_enabled():
-            # A tool can finish while this send yields. Keep its response
-            # behind the commit without masking speech that starts meanwhile.
+            # A tool can finish while the commit is in flight. Keep every
+            # response behind the API's acknowledgement of the commit, without
+            # masking speech that starts meanwhile.
             self._audio_commit_in_progress = True
-            try:
-                await self.send_client_event(events.InputAudioBufferCommitEvent())
-            finally:
-                self._audio_commit_in_progress = False
             self._results_awaiting_response = True
+            self._cancel_audio_commit_fallback()
+            self._audio_commit_fallback = asyncio.create_task(self._release_unacknowledged_commit())
+            await self.send_client_event(events.InputAudioBufferCommitEvent())
+            await self._create_response()
+
+    def _cancel_audio_commit_fallback(self):
+        if (
+            self._audio_commit_fallback
+            and self._audio_commit_fallback is not asyncio.current_task()
+        ):
+            self._audio_commit_fallback.cancel()
+        self._audio_commit_fallback = None
+
+    async def _handle_evt_audio_committed(self, evt):
+        """Release a response owed behind an acknowledged manual commit."""
+        if not self._audio_commit_in_progress:
+            return
+        self._cancel_audio_commit_fallback()
+        await self._finish_audio_commit()
+
+    async def _release_unacknowledged_commit(self):
+        # An empty or refused commit is never acknowledged. Don't hold the
+        # turn's response forever; the API's own error still reaches the log.
+        await asyncio.sleep(AUDIO_COMMIT_ACK_TIMEOUT_SECONDS)
+        self._audio_commit_fallback = None
+        logger.warning(f"{self} manual audio commit was not acknowledged; releasing the response")
+        await self._finish_audio_commit()
+
+    async def _finish_audio_commit(self):
+        self._audio_commit_in_progress = False
+        if self._response_create_owed and not self._response_active and not self._user_speaking:
+            self._response_create_owed = False
             await self._create_response()
 
     async def _handle_bot_stopped_speaking(self):
@@ -801,6 +838,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._interrupted_response_ids.clear()
             self._response_active = False
             self._user_speaking = False
+            self._cancel_audio_commit_fallback()
             self._audio_commit_in_progress = False
             self._response_create_owed = False
             self._disconnecting = False
@@ -919,7 +957,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             elif evt.type == "input_audio_buffer.speech_stopped":
                 await self._handle_evt_speech_stopped(evt)
             elif evt.type == "input_audio_buffer.committed":
-                pass
+                await self._handle_evt_audio_committed(evt)
             elif evt.type == "input_audio_buffer.cleared":
                 pass
             elif evt.type == "input_audio_buffer.timeout_triggered":

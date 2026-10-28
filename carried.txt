@@ -1,7 +1,7 @@
 Upstream baseline: pipecat-ai/pipecat v1.14.0
 Baseline commit: 82c4fdb484db32e3ef933d03c59a395dd7f9a53b
 
-fix/livekit-dtmf-sequence: send complete native DTMF sequences and propagate errors.
+carry/livekit-dtmf-sequence: send complete native DTMF sequences and propagate errors.
 Upstream pull request: https://github.com/pipecat-ai/pipecat/pull/6371
 Drop when an official release includes the fix.
 

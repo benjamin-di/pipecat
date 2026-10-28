@@ -6,6 +6,7 @@
 
 """Tests for user-audio and interruption handling in GrokRealtimeLLMService."""
 
+import asyncio
 import base64
 from typing import Any
 
@@ -36,6 +37,7 @@ def _make_service(*, server_vad: bool) -> tuple[GrokRealtimeLLMService, _EventRe
             session_properties=SessionProperties(turn_detection=turn_detection),
         ),
     )
+    service.create_task = lambda coroutine, name: asyncio.create_task(coroutine, name=name)
     recorder = _EventRecorder()
     service.send_client_event = recorder  # type: ignore[method-assign]
 
@@ -53,6 +55,21 @@ def _audio_frame(data: bytes = b"\xaa\xbb") -> InputAudioRawFrame:
 def test_default_model_is_grok_voice_latest():
     service = GrokRealtimeLLMService(api_key="test-key")
     assert service._settings.model == "grok-voice-latest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_vad", [False, True])
+async def test_session_update_serializes_explicit_manual_mode(server_vad):
+    from unittest.mock import AsyncMock
+
+    props = SessionProperties(
+        turn_detection=TurnDetection(type="server_vad") if server_vad else None
+    )
+    service = GrokRealtimeLLMService(api_key="test-key")
+    service._ws_send = AsyncMock()
+    await service.send_client_event(events.SessionUpdateEvent(session=props))
+    actual = service._ws_send.await_args.args[0]["session"]["turn_detection"]
+    assert actual == ({"type": "server_vad"} if server_vad else None)
 
 
 @pytest.mark.asyncio
@@ -111,6 +128,207 @@ async def test_manual_turn_interruption_preserves_the_interrupting_user_audio():
         "InputAudioBufferAppendEvent",
         "ResponseCancelEvent",
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_reply_waits_for_manual_user_turn_commit():
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    await service._handle_user_started_speaking(None)
+    service._results_awaiting_response = True
+    await service._create_response()
+    assert recorder.kinds() == []
+    assert service._response_create_owed
+    await service._handle_user_stopped_speaking(None)
+    # The API can start a response before it processes the commit; the reply
+    # would then omit the user's turn. Wait for the acknowledgement.
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resumes_speaking", [False, True])
+async def test_tool_reply_cannot_overtake_an_in_progress_audio_commit(resumes_speaking):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    committing, release = asyncio.Event(), asyncio.Event()
+
+    async def send(event):
+        if isinstance(event, events.InputAudioBufferCommitEvent):
+            committing.set()
+            await release.wait()
+        await recorder(event)
+
+    service.send_client_event = send
+    await service._handle_user_started_speaking(None)
+    stopped = asyncio.create_task(service._handle_user_stopped_speaking(None))
+    try:
+        await asyncio.wait_for(committing.wait(), 1)
+        service._results_awaiting_response = True
+        await service._create_response()
+        before_commit = recorder.kinds()
+        if resumes_speaking:
+            await service._handle_user_started_speaking(None)
+    finally:
+        release.set()
+        await stopped
+
+    assert before_commit == []
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"] + (
+        [] if resumes_speaking else ["ResponseCreateEvent"]
+    )
+    if resumes_speaking:
+        assert service._user_speaking
+        await service._handle_user_stopped_speaking(None)
+        await service._handle_evt_audio_committed(None)
+        assert recorder.kinds() == [
+            "InputAudioBufferCommitEvent",
+            "InputAudioBufferCommitEvent",
+            "ResponseCreateEvent",
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged_first", [True, False])
+async def test_manual_response_waits_for_previous_response_to_finish(acknowledged_first):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    service._response_active = True
+    await service._handle_user_stopped_speaking(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    done = events.ResponseDone(
+        type="response.done",
+        event_id="event-done",
+        response=events.Response(
+            id="response-a", object="realtime.response", status="completed", output=[]
+        ),
+    )
+    # Either order of acknowledgement and response completion yields one reply.
+    if acknowledged_first:
+        await service._handle_evt_audio_committed(None)
+        assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+        await service._handle_evt_response_done(done)
+    else:
+        await service._handle_evt_response_done(done)
+        assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+        await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_manual_commit_releases_the_response_after_its_bound(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.05)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    await service._handle_user_stopped_speaking(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    await asyncio.sleep(0.2)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+    # A late acknowledgement after the fallback starts nothing further.
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+async def test_ignored_manual_commit_is_replayed_after_clearing_the_buffer(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(llm, "REPLAY_APPEND_BYTES", 4)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+
+    async def send(event):
+        await recorder(event)
+        # The API acknowledges clearing, then the replayed commit.
+        if isinstance(event, events.InputAudioBufferClearEvent):
+            service._input_cleared.set()
+
+    service.send_client_event = send
+    turn = b"\x01\x02\x03\x04\x05\x06"
+    await service._send_user_audio(_audio_frame(turn))
+    await service._handle_user_stopped_speaking(None)
+    # Speech after the commit belongs to the next turn and must survive the clear.
+    await service._send_user_audio(_audio_frame(b"\x07\x08"))
+    await asyncio.sleep(0.08)
+    kinds = recorder.kinds()
+    assert kinds == [
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferCommitEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferClearEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferAppendEvent",
+        "InputAudioBufferCommitEvent",
+        "InputAudioBufferAppendEvent",
+    ]
+    replayed = b"".join(base64.b64decode(e.audio) for e in recorder.events[4:6])
+    assert replayed == turn
+    assert base64.b64decode(recorder.events[7].audio) == b"\x07\x08"
+    # No reply is requested until the replayed commit is acknowledged.
+    assert "ResponseCreateEvent" not in kinds
+    recovery = service._audio_commit_fallback
+    await service._handle_evt_audio_committed(None)
+    await asyncio.wait_for(recovery, 1)
+    assert recorder.kinds()[-1] == "ResponseCreateEvent"
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+    await asyncio.sleep(0.1)
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+    assert service._turn_audio == bytearray(b"\x07\x08")
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_commit_acknowledgement_starts_no_response():
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == []
+    assert not service._audio_commit_in_progress
 
 
 @pytest.mark.asyncio
@@ -211,3 +429,140 @@ async def test_force_message_sends_force_message_item():
     item = recorder.events[0].item
     assert item.type == "force_message"
     assert item.content[0].text == "This call is being recorded."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["clear", "append", "recommit", "restore"])
+async def test_late_acknowledgements_cannot_cancel_replay_or_mix_resumed_speech(monkeypatch, phase):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(llm, "REPLAY_APPEND_BYTES", 4)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    turn, following, resumed = b"abcdefgh", b"ij", b"kl"
+    reached, release = asyncio.Event(), asyncio.Event()
+    replaying = False
+    recommitting = False
+
+    async def send(event):
+        nonlocal replaying, recommitting
+        await recorder(event)
+        current = None
+        if isinstance(event, events.InputAudioBufferClearEvent):
+            replaying = True
+            service._input_cleared.set()
+            current = "clear"
+        elif replaying and isinstance(event, events.InputAudioBufferCommitEvent):
+            recommitting = True
+            current = "recommit"
+        elif replaying and isinstance(event, events.InputAudioBufferAppendEvent):
+            current = "restore" if recommitting else "append"
+        if current == phase and not reached.is_set():
+            reached.set()
+            await release.wait()
+
+    service.send_client_event = send
+    await service._send_user_audio(_audio_frame(turn))
+    await service._handle_user_stopped_speaking(None)
+    await service._send_user_audio(_audio_frame(following))
+    recovery = service._audio_commit_fallback
+    await asyncio.wait_for(reached.wait(), 1)
+    await service._handle_evt_audio_committed(None)
+    await service._handle_evt_audio_committed(None)
+    await service._send_user_audio(_audio_frame(resumed))
+    assert not recovery.cancelled() and not recovery.done()
+    assert "ResponseCreateEvent" not in recorder.kinds()
+    release.set()
+    await asyncio.wait_for(recovery, 1)
+    kinds = recorder.kinds()
+    clear = kinds.index("InputAudioBufferClearEvent")
+    commit = kinds.index("InputAudioBufferCommitEvent", clear)
+    assert b"".join(base64.b64decode(e.audio) for e in recorder.events[clear + 1 : commit]) == turn
+    after = [
+        e
+        for e in recorder.events[commit + 1 :]
+        if isinstance(e, events.InputAudioBufferAppendEvent)
+    ]
+    assert b"".join(base64.b64decode(e.audio) for e in after) == following + resumed
+    assert service._turn_audio == following + resumed
+    assert kinds.count("InputAudioBufferCommitEvent") == 2
+    assert kinds.count("ResponseCreateEvent") == 1
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+
+
+@pytest.mark.asyncio
+async def test_next_completed_turn_waits_for_recovery_and_is_committed_separately(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.01)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def send(event):
+        await recorder(event)
+        if isinstance(event, events.InputAudioBufferClearEvent):
+            reached.set()
+            await release.wait()
+            service._input_cleared.set()
+
+    service.send_client_event = send
+    await service._send_user_audio(_audio_frame(b"ab"))
+    await service._handle_user_stopped_speaking(None)
+    recovery = service._audio_commit_fallback
+    await asyncio.wait_for(reached.wait(), 1)
+    await service._handle_user_started_speaking(None)
+    await service._send_user_audio(_audio_frame(b"cd"))
+    await service._handle_user_stopped_speaking(None)
+    assert service._pending_commit_audio == b"ab"
+    release.set()
+    await asyncio.wait_for(recovery, 1)
+    assert service._pending_commit_audio == b"cd"
+    assert recorder.kinds().count("InputAudioBufferCommitEvent") == 3
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds().count("ResponseCreateEvent") == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_joins_replay_before_clearing_audio_state(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.01)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    reached = asyncio.Event()
+
+    async def send(event):
+        await recorder(event)
+        if isinstance(event, events.InputAudioBufferClearEvent):
+            reached.set()
+            await asyncio.Event().wait()
+
+    service.send_client_event = send
+    service.push_frame = AsyncMock()
+    await service._send_user_audio(_audio_frame(b"ab"))
+    await service._handle_user_stopped_speaking(None)
+    recovery = service._audio_commit_fallback
+    await asyncio.wait_for(reached.wait(), 1)
+    await service._send_user_audio(_audio_frame(b"cd"))
+    await service._disconnect()
+    assert recovery.done() and recovery.cancelled()
+    assert not service._audio_commit_in_progress and not service._audio_recovering
+    assert not service._turn_audio and not service._recovery_audio
+    assert recorder.kinds().count("InputAudioBufferCommitEvent") == 1

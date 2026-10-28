@@ -13,6 +13,7 @@ https://docs.x.ai/docs/guides/voice/agent
 import base64
 import json
 import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -81,12 +82,14 @@ class CurrentAudioResponse:
         content_index: Index of the audio content within the item.
         start_time_ms: Timestamp when the audio response started in milliseconds.
         total_size: Total size of audio data received in bytes. Defaults to 0.
+        response_id: ID of the response that generated this audio.
     """
 
     item_id: str
     content_index: int
     start_time_ms: int
     total_size: int = 0
+    response_id: str = ""
 
 
 @dataclass
@@ -305,6 +308,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         self._current_assistant_response = None
         self._current_audio_response = None
+        self._interrupted_response_ids: deque[str] = deque(maxlen=64)
 
         self._messages_added_manually = {}
         self._pending_function_calls = {}
@@ -423,14 +427,11 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
     async def _handle_interruption(self):
         """Handle user interruption of assistant speech.
 
-        Always send ``response.cancel`` so in-flight assistant audio stops on
-        the wire promptly. When server VAD is off, also clear the input buffer
-        (manual turn mode owns commit/cancel). With server VAD on, leave the
-        input buffer intact so the interrupting user speech is not wiped.
+        Cancel assistant output without clearing audio already captured from the
+        interrupting user. The input buffer is consumed by the turn's commit.
         """
-        if not self._is_turn_detection_enabled():
-            await self.send_client_event(events.InputAudioBufferClearEvent())
-
+        if self._current_response_id:
+            self._interrupted_response_ids.append(self._current_response_id)
         await self.send_client_event(events.ResponseCancelEvent())
 
         await self._truncate_current_audio_response()
@@ -479,6 +480,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         try:
             current = self._current_audio_response
+            if current.response_id:
+                self._interrupted_response_ids.append(current.response_id)
             self._current_audio_response = None
 
             audio_duration_ms = self._calculate_audio_duration_ms(current.total_size)
@@ -781,6 +784,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             # A new session knows none of the old call ids, and no response is
             # running in it.
             self._open_function_calls = set()
+            self._interrupted_response_ids.clear()
             self._response_active = False
             self._response_create_owed = False
             self._disconnecting = False
@@ -1009,6 +1013,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_evt_audio_delta(self, evt):
         """Handle audio delta event - streaming audio from assistant."""
+        if evt.response_id in self._interrupted_response_ids:
+            return
         await self.stop_ttfb_metrics()
 
         if not self._current_audio_response:
@@ -1016,6 +1022,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 item_id=evt.item_id,
                 content_index=evt.content_index,
                 start_time_ms=int(time.time() * 1000),
+                response_id=evt.response_id,
             )
             await self.push_frame(TTSStartedFrame())
 
@@ -1031,6 +1038,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_evt_audio_done(self, evt):
         """Handle audio done event."""
+        if evt.response_id in self._interrupted_response_ids:
+            return
         if self._current_audio_response:
             await self.push_frame(TTSStoppedFrame())
 
@@ -1115,6 +1124,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_evt_audio_transcript_delta(self, evt):
         """Handle audio transcript delta event."""
+        if evt.response_id in self._interrupted_response_ids:
+            return
         if evt.delta:
             await self._push_output_transcript_text_frames(evt.delta)
 

@@ -77,6 +77,9 @@ from . import events
 AUDIO_COMMIT_ACK_TIMEOUT_SECONDS = 2.0
 # Bound for the API to acknowledge clearing the input buffer before a replay.
 AUDIO_CLEAR_ACK_TIMEOUT_SECONDS = 1.0
+# Bound for a cancelled response to finish before a commit's acknowledgement is
+# timed. The API acknowledges a commit only after the cancelled response is done.
+CANCEL_SETTLE_TIMEOUT_SECONDS = 8.0
 # Retained manual-turn input for one commit replay (about a minute of 16 kHz PCM).
 MAX_REPLAY_AUDIO_BYTES = 2_000_000
 REPLAY_APPEND_BYTES = 32_000
@@ -350,8 +353,16 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._audio_replay_writes = False
         self._replay_commit_sent = False
         self._replay_committed = asyncio.Event()
+        # The original commit was acknowledged after its replay began: the turn
+        # is already committed and a replay would duplicate it.
+        self._original_committed = asyncio.Event()
         self._recovery_audio = bytearray()
         self._audio_commit_owed = False
+        # Cleared while a cancelled response is still running. The API holds
+        # later commit acknowledgements until it is done, so a slow cancel is
+        # not evidence of an ignored commit.
+        self._cancel_settled = asyncio.Event()
+        self._cancel_settled.set()
 
         self._session_id: str | None = None
         self._conversation_id: str | None = None
@@ -460,6 +471,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """
         if self._current_response_id:
             self._interrupted_response_ids.append(self._current_response_id)
+        if self._response_active:
+            self._cancel_settled.clear()
         await self.send_client_event(events.ResponseCancelEvent())
 
         await self._truncate_current_audio_response()
@@ -511,10 +524,13 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if not self._audio_commit_in_progress:
             return
         if self._audio_recovering:
-            # An acknowledgement cannot cancel a partially transmitted replay.
-            # Before recommit it can only belong to the original attempt.
+            # The API handles events in order, so before the recommit an
+            # acknowledgement belongs to the original commit: the turn is
+            # committed, and the replay must stop without committing it again.
             if self._replay_commit_sent:
                 self._replay_committed.set()
+            else:
+                self._original_committed.set()
             return
         self._cancel_audio_commit_fallback()
         await self._finish_audio_commit()
@@ -526,7 +542,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         segment. Replay the committed turn, commit it again and restore input
         received since. An empty or refused commit is never acknowledged either;
         after the replay, don't hold the turn's response forever.
+
+        The acknowledgement is timed only once a cancelled response is done: the
+        API holds it until then. If the original commit is acknowledged before
+        the replay is committed, the replay stops and its audio is cleared.
         """
+        try:
+            await asyncio.wait_for(self._cancel_settled.wait(), CANCEL_SETTLE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning(f"{self} cancelled response did not finish")
         await asyncio.sleep(AUDIO_COMMIT_ACK_TIMEOUT_SECONDS)
         replay = self._pending_commit_audio
         if replay:
@@ -535,40 +559,56 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._audio_replay_writes = True
             self._replay_commit_sent = False
             self._replay_committed.clear()
+            self._original_committed.clear()
             self._recovery_audio = bytearray(self._turn_audio)
-            self._input_cleared.clear()
             try:
-                await self.send_client_event(events.InputAudioBufferClearEvent())
-                try:
-                    await asyncio.wait_for(
-                        self._input_cleared.wait(), AUDIO_CLEAR_ACK_TIMEOUT_SECONDS
+                await self._clear_input_buffer()
+                replayed = False
+                for offset in range(0, len(replay), REPLAY_APPEND_BYTES):
+                    if self._original_committed.is_set():
+                        break
+                    await self._append_audio_bytes(replay[offset : offset + REPLAY_APPEND_BYTES])
+                    replayed = True
+                if self._original_committed.is_set():
+                    logger.warning(
+                        f"{self} original audio commit was acknowledged late; replay stopped"
                     )
-                except TimeoutError:
-                    logger.warning(f"{self} input buffer clear was not acknowledged")
-                await self._append_audio_bytes(replay)
-                self._replay_commit_sent = True
-                await self.send_client_event(events.InputAudioBufferCommitEvent())
-                # Newly arriving input is buffered until all replay bytes have
-                # been committed. Drain each byte once, including arrivals while
-                # a restoration write yields, without blocking frame processing.
+                    if replayed:
+                        await self._clear_input_buffer()
+                else:
+                    self._replay_commit_sent = True
+                    await self.send_client_event(events.InputAudioBufferCommitEvent())
+                # Newly arriving input is buffered until the replay is resolved.
+                # Drain each byte once, including arrivals while a restoration
+                # write yields, without blocking frame processing.
                 while self._recovery_audio:
                     audio = bytes(self._recovery_audio)
                     self._recovery_audio.clear()
                     await self._append_audio_bytes(audio)
                 self._audio_replay_writes = False
-                try:
-                    await asyncio.wait_for(
-                        self._replay_committed.wait(), AUDIO_COMMIT_ACK_TIMEOUT_SECONDS
-                    )
-                except TimeoutError:
-                    logger.warning(f"{self} replayed audio commit was not acknowledged")
+                if self._replay_commit_sent:
+                    try:
+                        await asyncio.wait_for(
+                            self._replay_committed.wait(), AUDIO_COMMIT_ACK_TIMEOUT_SECONDS
+                        )
+                    except TimeoutError:
+                        logger.warning(f"{self} replayed audio commit was not acknowledged")
             finally:
                 self._audio_recovering = False
                 self._audio_replay_writes = False
                 self._replay_commit_sent = False
+                self._original_committed.clear()
                 self._recovery_audio.clear()
         self._audio_commit_fallback = None
         await self._finish_audio_commit()
+
+    async def _clear_input_buffer(self):
+        self._input_cleared.clear()
+        await self.send_client_event(events.InputAudioBufferClearEvent())
+        try:
+            await asyncio.wait_for(self._input_cleared.wait(), AUDIO_CLEAR_ACK_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning(f"{self} input buffer clear was not acknowledged")
 
     async def _append_audio_bytes(self, audio: bytes):
         for offset in range(0, len(audio), REPLAY_APPEND_BYTES):
@@ -932,6 +972,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._audio_replay_writes = False
             self._replay_commit_sent = False
             self._recovery_audio.clear()
+            self._original_committed.clear()
+            self._cancel_settled.set()
             self._pending_commit_audio = None
             self._turn_audio.clear()
             self._response_create_owed = False
@@ -1236,6 +1278,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
     async def _handle_evt_response_done(self, evt):
         """Handle response.done event."""
         self._response_active = False
+        self._cancel_settled.set()
         # A response asked for while this one was running is owed now, unless
         # this one took in what it was for.
         if self._response_create_owed:

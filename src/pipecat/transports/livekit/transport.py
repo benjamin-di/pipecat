@@ -14,6 +14,7 @@ event handling for conversational AI applications.
 import asyncio
 import functools
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -168,6 +169,9 @@ class LiveKitParams(TransportParams):
             ``InputAudioRawFrame``s.
         audio_out_queue_size_ms: Buffer size of the outgoing audio source, in milliseconds
             (LiveKit's default is 1000).
+        audio_out_realtime_pacing: Pace writes on a monotonic sample clock rather than
+            native queue capacity. Continuous mixers keep their clock across interruptions,
+            even when the native audio queue is cleared. Defaults to False.
         video_out_max_bitrate: Maximum bitrate of the published video track, in bits
             per second, capped at ``video_out_framerate``. LiveKit chooses the encoding
             from the track resolution when unset.
@@ -175,6 +179,7 @@ class LiveKitParams(TransportParams):
 
     audio_in_user_tracks: bool = True
     audio_out_queue_size_ms: int = 1000
+    audio_out_realtime_pacing: bool = False
     video_out_max_bitrate: int | None = None
 
 
@@ -1383,6 +1388,7 @@ class LiveKitOutputTransport(BaseOutputTransport):
         # Formats already reported as unsupported, so the error is logged once
         # per format instead of once per frame.
         self._unsupported_video_formats: set[str | None] = set()
+        self._audio_next_write: float | None = None
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport with shared client setup.
@@ -1476,8 +1482,18 @@ class LiveKitOutputTransport(BaseOutputTransport):
         Returns:
             True if the audio frame was written successfully, False otherwise.
         """
+        if self._params.audio_out_realtime_pacing:
+            now = time.monotonic()
+            if self._audio_next_write is None or now - self._audio_next_write > 0.1:
+                # Sparse output starts a new clock; continuous output must not
+                # refill a cleared native queue with a burst of extra samples.
+                self._audio_next_write = now
+            await asyncio.sleep(max(0, self._audio_next_write - now))
         livekit_audio = self._convert_pipecat_audio_to_livekit(frame.audio)
-        return await self._client.publish_audio(livekit_audio)
+        sent = await self._client.publish_audio(livekit_audio)
+        if sent and self._params.audio_out_realtime_pacing:
+            self._audio_next_write += livekit_audio.samples_per_channel / livekit_audio.sample_rate
+        return sent
 
     async def write_video_frame(self, frame: OutputImageRawFrame) -> bool:
         """Write a video frame to the LiveKit room's published camera track.

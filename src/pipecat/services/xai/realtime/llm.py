@@ -1430,11 +1430,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._response_create_owed = True
             return
 
-        assert self._context is not None
-
-        adapter = self.get_llm_adapter()
-
-        if self._llm_needs_conversation_setup:
+        if self._llm_needs_conversation_setup and self._context is not None:
+            adapter = self.get_llm_adapter()
             self._log_llm_conversation_setup(self._context)
 
             llm_invocation_params = await adapter.get_llm_invocation_params(self._context)

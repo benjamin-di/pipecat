@@ -492,18 +492,13 @@ class LiveKitTransportClient:
             digit: The DTMF digit to send (0-9, \*, #).
         """
         if not self._connected:
-            return
+            raise RuntimeError("Cannot send DTMF before connecting to LiveKit")
 
         if digit not in DTMF_CODE_MAP:
-            logger.warning(f"Invalid DTMF digit: {digit}")
-            return
+            raise ValueError("Invalid DTMF digit")
 
         code = DTMF_CODE_MAP[digit]
-
-        try:
-            await self.room.local_participant.publish_dtmf(code=code, digit=digit)
-        except Exception as e:
-            logger.error(f"Error sending DTMF tone {digit}: {e}")
+        await self.room.local_participant.publish_dtmf(code=code, digit=digit)
 
     async def publish_audio(self, audio_frame: rtc.AudioFrame) -> bool:
         """Publish an audio frame to the room.

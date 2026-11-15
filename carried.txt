@@ -5,6 +5,8 @@ Release v1.16.0 includes #6371's ordered native DTMF sequence implementation.
 Its canonical commit 682bd3c891fbb7b7265cfc3fc5a1ec05bbc3b1ab is an ancestor.
 The original failure regressions still require the narrow client error carry:
 disconnected/invalid requests and publication failures must remain observable.
+Frame-driven failures stop remaining digits and report one pipeline error while
+preserving subsequent audio; direct client calls continue to raise failures.
 
 Continuous recording sample clocks: retain unmatched samples across flushes,
 without interpreting delivery jitter as silence. Issue:
@@ -17,6 +19,7 @@ Remove after the interrupted-output regressions pass on an official release.
 
 Manual turns depend on interruption isolation. Retain explicit null turn detection,
 commit/tool ordering, ignored-commit recovery and late-acknowledgement handling.
+Context-free audio turns remain supported; context setup waits until one arrives.
 Remove after the manual-turn, resumed-input and recovery regressions pass on a release.
 
 LiveKit output pacing is opt-in and keeps its sample clock across queue clears.

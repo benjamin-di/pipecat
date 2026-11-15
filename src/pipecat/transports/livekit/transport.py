@@ -1536,8 +1536,11 @@ class LiveKitOutputTransport(BaseOutputTransport):
         Args:
             frame: The DTMF frame to write.
         """
-        for button in frame.buttons or []:
-            await self._client.send_dtmf(button.value)
+        try:
+            for button in frame.buttons or []:
+                await self._client.send_dtmf(button.value)
+        except Exception as error:
+            await self.push_error("Error sending native DTMF sequence", exception=error)
 
     def _convert_pipecat_audio_to_livekit(self, pipecat_audio: bytes) -> rtc.AudioFrame:
         """Convert Pipecat audio data to LiveKit audio frame."""

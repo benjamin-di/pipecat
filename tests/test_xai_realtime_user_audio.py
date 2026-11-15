@@ -156,6 +156,61 @@ async def test_tool_reply_waits_for_manual_user_turn_commit():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged", [True, False])
+async def test_manual_audio_without_context_creates_one_response(monkeypatch, acknowledged):
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.services.xai.realtime import llm
+
+    monkeypatch.setattr(llm, "AUDIO_COMMIT_ACK_TIMEOUT_SECONDS", 0.01)
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service.push_frame = AsyncMock()
+    assert service._context is None
+    await service._handle_user_stopped_speaking(None)
+    recovery = service._audio_commit_fallback
+    if acknowledged:
+        await service._handle_evt_audio_committed(None)
+    else:
+        await asyncio.wait_for(recovery, 1)
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "ResponseCreateEvent"]
+    assert service._llm_needs_conversation_setup
+
+    service._response_active = False
+    service._context = LLMContext([{"role": "user", "content": "Initial context"}])
+    await service._create_response()
+    assert recorder.kinds()[2:] == [
+        "ConversationItemCreateEvent",
+        "SessionUpdateEvent",
+        "ResponseCreateEvent",
+    ]
+    assert not service._llm_needs_conversation_setup
+
+
+@pytest.mark.asyncio
+async def test_context_free_manual_response_waits_for_resumed_speech():
+    from unittest.mock import AsyncMock
+
+    service, recorder = _make_service(server_vad=False)
+    service._api_session_ready = True
+    service.push_frame = AsyncMock()
+    await service._handle_user_stopped_speaking(None)
+    await service._handle_user_started_speaking(None)
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    await service._handle_user_stopped_speaking(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent", "InputAudioBufferCommitEvent"]
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == [
+        "InputAudioBufferCommitEvent",
+        "InputAudioBufferCommitEvent",
+        "ResponseCreateEvent",
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("resumes_speaking", [False, True])
 async def test_tool_reply_cannot_overtake_an_in_progress_audio_commit(resumes_speaking):
     from unittest.mock import AsyncMock

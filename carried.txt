@@ -1,25 +1,27 @@
-Upstream baseline: pipecat-ai/pipecat v1.14.0
-Baseline commit: 82c4fdb484db32e3ef933d03c59a395dd7f9a53b
+Upstream baseline: pipecat-ai/pipecat v1.16.0
+Baseline commit: 7cf75afc37f321ecce1822901351bc5fdc372e0b
 
-carry/livekit-dtmf-sequence: send complete native DTMF sequences and propagate errors.
-Upstream pull request: https://github.com/pipecat-ai/pipecat/pull/6371
-Drop when an official release includes the fix.
+Release v1.16.0 includes #6371's ordered native DTMF sequence implementation.
+Its canonical commit 682bd3c891fbb7b7265cfc3fc5a1ec05bbc3b1ab is an ancestor.
+The original failure regressions still require the narrow client error carry:
+disconnected/invalid requests and publication failures must remain observable.
 
-fix/audio-continuous-clock: preserve sample clocks and unmatched samples across
-continuous-stream recording flushes. Upstream proposal: unsubmitted.
-Drop when an official release includes the behavior and its sample-clock tests pass.
+Continuous recording sample clocks: retain unmatched samples across flushes,
+without interpreting delivery jitter as silence. Issue:
+https://github.com/pipecat-ai/pipecat/issues/6492
+Remove after the sample-clock regressions pass on an official release.
 
-fix/xai-interruption-isolation: retain interrupting input and suppress late output
-from cancelled responses. Upstream proposal: unsubmitted.
-Drop when an official release passes the interruption-isolation regressions.
+Interruption isolation: preserve interrupting input and suppress cancelled output.
+https://github.com/pipecat-ai/pipecat/issues/6491
+Remove after the interrupted-output regressions pass on an official release.
 
-fix/xai-manual-turn-coordination (based on fix/xai-interruption-isolation): serialize
-explicit null turn detection, defer tool replies until turn commit, retain and
-replay one ignored commit, finish recovery despite late acknowledgements, and
-restore new speech without mixing turns. Upstream proposal: unsubmitted.
-Drop when an official release passes manual-turn, resumed-speech and recovery tests.
+Manual turns depend on interruption isolation. Retain explicit null turn detection,
+commit/tool ordering, ignored-commit recovery and late-acknowledgement handling.
+Remove after the manual-turn, resumed-input and recovery regressions pass on a release.
 
-build/carried-media-checks: generic CI for the carried media regressions.
-Drop when the runtime topics are removed. Immutable release tags are retained.
-The consuming wrapper records exact topic heads, fixed merge order and removal
-conditions. No application prompts, credentials, deployment or call data are carried.
+LiveKit output pacing is opt-in and keeps its sample clock across queue clears.
+https://github.com/pipecat-ai/pipecat/issues/6493
+Remove after an official release passes output-clock and receiver-alignment checks.
+
+Generic media CI and test-only DTMF coverage support these runtime carries.
+No application prompts, credentials, deployment configuration or call data are carried.

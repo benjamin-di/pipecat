@@ -1364,6 +1364,8 @@ class LiveKitOutputTransport(BaseOutputTransport):
     when ``LiveKitParams.video_out_enabled`` is set.
     """
 
+    _params: LiveKitParams
+
     def __init__(
         self,
         transport: BaseTransport,
@@ -1479,17 +1481,22 @@ class LiveKitOutputTransport(BaseOutputTransport):
         Returns:
             True if the audio frame was written successfully, False otherwise.
         """
+        next_write = None
         if self._params.audio_out_realtime_pacing:
             now = time.monotonic()
-            if self._audio_next_write is None or now - self._audio_next_write > 0.1:
+            next_write = self._audio_next_write
+            if next_write is None or now - next_write > 0.1:
                 # Sparse output starts a new clock; continuous output must not
                 # refill a cleared native queue with a burst of extra samples.
-                self._audio_next_write = now
-            await asyncio.sleep(max(0, self._audio_next_write - now))
+                next_write = now
+            self._audio_next_write = next_write
+            await asyncio.sleep(max(0, next_write - now))
         livekit_audio = self._convert_pipecat_audio_to_livekit(frame.audio)
         sent = await self._client.publish_audio(livekit_audio)
-        if sent and self._params.audio_out_realtime_pacing:
-            self._audio_next_write += livekit_audio.samples_per_channel / livekit_audio.sample_rate
+        if sent and next_write is not None:
+            self._audio_next_write = (
+                next_write + livekit_audio.samples_per_channel / livekit_audio.sample_rate
+            )
         return sent
 
     async def write_video_frame(self, frame: OutputImageRawFrame) -> bool:

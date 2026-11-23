@@ -315,6 +315,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         self._disconnecting = False
         self._api_session_ready = False
+        self._server_turn_detection_type: str | None = None
         self._run_llm_when_api_session_ready = False
         self._logged_audio_drop_before_session_ready = False
 
@@ -509,7 +510,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._recover_unacknowledged_commit(), name="audio-commit-recovery"
         )
         await self.send_client_event(events.InputAudioBufferCommitEvent())
-        await self._create_response()
+        if self._server_turn_detection_type != "client_controlled":
+            await self._create_response()
 
     def _cancel_audio_commit_fallback(self):
         if (
@@ -948,6 +950,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         try:
             self._disconnecting = True
             self._api_session_ready = False
+            self._server_turn_detection_type = None
             self._logged_audio_drop_before_session_ready = False
             await self.stop_all_metrics()
 
@@ -1161,6 +1164,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """Handle session.updated event."""
         if getattr(evt.session, "id", None):
             self._session_id = evt.session.id
+        td = getattr(evt.session, "turn_detection", None)
+        self._server_turn_detection_type = getattr(td, "type", None)
         self._api_session_ready = True
         if self._run_llm_when_api_session_ready:
             self._run_llm_when_api_session_ready = False

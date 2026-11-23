@@ -388,6 +388,33 @@ async def test_unsolicited_commit_acknowledgement_starts_no_response():
 
 
 @pytest.mark.asyncio
+async def test_client_controlled_commit_does_not_send_duplicate_response_create():
+    from unittest.mock import AsyncMock
+
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, recorder = _make_service(server_vad=False)
+    service._llm_needs_conversation_setup = False
+    service._context = LLMContext()
+    service.push_frame = AsyncMock()
+    await service._handle_evt_session_updated(
+        events.SessionUpdatedEvent(
+            type="session.updated",
+            event_id="evt-cc",
+            session=events.SessionProperties(
+                turn_detection=events.TurnDetection(type="client_controlled"),
+            ),
+        )
+    )
+    assert service._api_session_ready
+    assert service._server_turn_detection_type == "client_controlled"
+    await service._commit_audio_turn()
+    await service._handle_evt_audio_committed(None)
+    assert recorder.kinds() == ["InputAudioBufferCommitEvent"]
+    assert not service._audio_commit_in_progress
+
+
+@pytest.mark.asyncio
 async def test_late_cancelled_audio_and_transcript_cannot_restart_playback():
     from unittest.mock import AsyncMock
 

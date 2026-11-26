@@ -69,6 +69,7 @@ from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_realtime_llm
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 from . import events
@@ -198,6 +199,7 @@ class GrokRealtimeLLMSettings(LLMSettings):
         return instance
 
 
+@traced_realtime_llm
 class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
     """Grok Realtime Voice Agent LLM service providing real-time audio and text communication.
 
@@ -315,6 +317,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         self._disconnecting = False
         self._api_session_ready = False
+        self._server_turn_detection_type: str | None = None
         self._run_llm_when_api_session_ready = False
         self._logged_audio_drop_before_session_ready = False
 
@@ -509,7 +512,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._recover_unacknowledged_commit(), name="audio-commit-recovery"
         )
         await self.send_client_event(events.InputAudioBufferCommitEvent())
-        await self._create_response()
+        if self._server_turn_detection_type != "client_controlled":
+            await self._create_response()
 
     def _cancel_audio_commit_fallback(self):
         if (
@@ -892,6 +896,9 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         :meth:`_handle_context`). Before the session's conversation is set up,
         nothing is sent: the setup sends the context, which the aggregator
         records the messages in.
+
+        The messages are taken from this frame, not read from the context.
+        ``LLMUserAggregator._realtime_handle_messages_append`` explains why.
         """
         if not self._api_session_ready or self._llm_needs_conversation_setup:
             return
@@ -948,6 +955,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         try:
             self._disconnecting = True
             self._api_session_ready = False
+            self._server_turn_detection_type = None
             self._logged_audio_drop_before_session_ready = False
             await self.stop_all_metrics()
 
@@ -1161,6 +1169,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """Handle session.updated event."""
         if getattr(evt.session, "id", None):
             self._session_id = evt.session.id
+        td = getattr(evt.session, "turn_detection", None)
+        self._server_turn_detection_type = getattr(td, "type", None)
         self._api_session_ready = True
         if self._run_llm_when_api_session_ready:
             self._run_llm_when_api_session_ready = False
